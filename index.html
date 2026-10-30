@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GameFlow — симулятор игровых процессов</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app">
+
+  <header id="toolbar">
+    <div class="tb-group brand" title="Интерактивный симулятор игровых процессов">🎮 GameFlow</div>
+
+    <div class="tb-group pages">
+      <div id="pageTabs" class="tabs"></div>
+      <button id="btnAddPage" class="tbtn" title="Добавить страницу">＋ стр.</button>
+      <button id="btnDelPage" class="tbtn" title="Удалить текущую страницу">− стр.</button>
+      <button id="btnClearPage" class="tbtn" title="Очистить текущую страницу">очистить</button>
+    </div>
+
+    <div class="tb-group sim">
+      <button id="btnPlay" class="tbtn primary" title="Старт / пауза (Пробел)">▶ Старт</button>
+      <button id="btnReset" class="tbtn" title="Сброс симуляции">⟲ Сброс</button>
+      <select id="selSpeed" title="Скорость симуляции">
+        <option value="0.25">×0.25</option>
+        <option value="0.5">×0.5</option>
+        <option value="1" selected>×1</option>
+        <option value="2">×2</option>
+        <option value="4">×4</option>
+        <option value="8">×8</option>
+        <option value="16">×16</option>
+      </select>
+      <span id="simTime" class="sim-time" title="Время симуляции">0.0 с</span>
+    </div>
+
+    <div class="tb-group data">
+      <button id="btnAddEnt" class="tbtn" title="Добавить сущность (или двойной клик по карте)">＋ Сущность</button>
+      <button id="btnImport" class="tbtn" title="Импорт схем из JSON-файла">⇧ Импорт</button>
+      <button id="btnExport" class="tbtn" title="Экспорт всех схем в JSON-файл">⇩ Экспорт</button>
+      <button id="btnHelp" class="tbtn icon" title="Справка">?</button>
+    </div>
+
+    <span id="saveStatus" class="save-status"></span>
+  </header>
+
+  <main id="main">
+    <section id="mapWrap">
+      <svg id="mapSvg"></svg>
+      <div id="mapOverlay">
+        <button id="btnFit" class="tbtn" title="Вписать карту в экран">⤢ Вписать</button>
+        <span class="map-hint">колесо — масштаб · фон — панорама · двойной клик — новая сущность</span>
+      </div>
+      <div id="mapHint" class="map-empty hidden">Страница пуста. Нажмите «＋ Сущность» или сделайте двойной клик по карте.</div>
+    </section>
+    <aside id="panel"></aside>
+  </main>
+
+  <footer id="logWrap" class="collapsed">
+    <div id="logBar">
+      <span class="log-title">Журнал симуляции</span>
+      <span id="logCount" class="log-count"></span>
+      <span class="spacer"></span>
+      <button id="btnClearLog" class="tbtn small">очистить</button>
+      <button id="btnToggleLog" class="tbtn small" title="Показать / скрыть журнал">▲</button>
+    </div>
+    <div id="logList"></div>
+  </footer>
+
+</div>
+
+<div id="helpModal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head"><b>Справка GameFlow</b><button id="btnCloseHelp" class="tbtn small">✕</button></div>
+    <div class="modal-body">
+      <h3>Философия</h3>
+      <p>Всё состоит из <b>сущностей</b> с <b>параметрами</b>. Любое игровое событие — это изменение параметров одной или нескольких сущностей. «Передача ресурса» = два изменения параметров в одном событии (у одной сущности −, у другой +).</p>
+      <h3>Карта сущностей</h3>
+      <p>Точки — сущности, стрелки — воздействия на параметры других сущностей. <b>Цвет стрелки = цвет события</b>, которое её создаёт. Наведите курсор на стрелку, чтобы увидеть подробности. Клик по сущности открывает панель настроек.</p>
+      <h3>Дерево событий</h3>
+      <p>У каждой сущности своё дерево событий (вкладка «События»). Событие длится заданное время, затем применяет свои воздействия и выбирает переход. Переходы выбираются по <b>приоритету</b> (больше — раньше проверяется), <b>условию</b> и <b>шансу</b>. Если подходящий переход не найден и включён <b>автоцикл</b>, процесс возвращается в точку входа. Событие может <b>повторяться</b> с заданным шансом/условием/лимитом.</p>
+      <h3>Формулы и условия</h3>
+      <p>Значение воздействия и условие — число или формула. Доступно: <code>+ − * / % ^</code>, скобки, сравнения <code>== != &lt; &gt; &lt;= &gt;=</code>, логика <code>&amp;&amp; || !</code>, тернарный <code>? :</code>, функции <code>min max abs round floor ceil sqrt pow log exp sin cos rand(a,b)</code>.</p>
+      <p>Переменные: <code>имя_параметра</code> — параметр текущей сущности, <code>Имя_сущности.имя_параметра</code> — любой глобальный параметр. Пример: <code>-(5 + агрессия * 0.5)</code>, <code>Королевство.золото &lt; 100</code>.</p>
+      <h3>Панель воздействий (🔍)</h3>
+      <p>Клик по 🔍 у параметра показывает все события всех сущностей, которые его меняют. Карта подсвечивает только источники. Там же задаётся <b>приоритет</b>: при одновременном изменении параметра несколькими источниками первым применяется воздействие с большим приоритетом.</p>
+      <h3>Данные</h3>
+      <p>Всё сохраняется в localStorage автоматически. Импорт/экспорт — JSON-файл со всеми страницами. Пробел — старт/пауза симуляции.</p>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="fileImport" accept=".json,application/json" class="hidden">
+
+<script src="js/formula.js"></script>
+<script src="js/store.js"></script>
+<script src="js/engine.js"></script>
+<script src="js/mapview.js"></script>
+<script src="js/panel.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
