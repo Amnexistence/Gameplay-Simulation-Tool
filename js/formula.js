@@ -40,6 +40,15 @@ const Formula = (() => {
         i = j;
         continue;
       }
+      if (c === '"' || c === "'") {
+        // цитируемое имя (параметры/сущности с пробелами и др. разделителями)
+        let j = i + 1;
+        while (j < s.length && s[j] !== c) j++;
+        if (j >= s.length) throw new Error('Незакрытая кавычка в имени');
+        t.push({ k: 'qid', v: s.slice(i + 1, j) });
+        i = j + 1;
+        continue;
+      }
       const two = s.slice(i, i + 2);
       if (['==', '!=', '<=', '>=', '&&', '||'].includes(two)) {
         t.push({ k: 'op', v: two }); i += 2; continue;
@@ -111,10 +120,10 @@ const Formula = (() => {
       const t = peek();
       if (!t) throw new Error('Неожиданный конец выражения');
       if (t.k === 'num') { i++; return { t: 'num', v: t.v }; }
-      if (t.k === 'id') {
+      if (t.k === 'id' || t.k === 'qid') {
         i++;
         const nx = peek();
-        if (nx && nx.k === 'op' && nx.v === '(') {
+        if (t.k === 'id' && nx && nx.k === 'op' && nx.v === '(') {
           i++;
           const args = [];
           if (!eat(')')) {
@@ -128,7 +137,7 @@ const Formula = (() => {
         while (peek() && peek().k === 'op' && peek().v === '.') {
           i++;
           const nt = peek();
-          if (!nt || nt.k !== 'id') throw new Error('Ожидалось имя параметра после «.»');
+          if (!nt || (nt.k !== 'id' && nt.k !== 'qid')) throw new Error('Ожидалось имя параметра после «.»');
           i++;
           path.push(nt.v);
         }

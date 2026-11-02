@@ -19,6 +19,14 @@ const U = {
   num(v, def) { const n = parseFloat(v); return isNaN(n) ? def : n; },
   clamp(v, a, b) { return Math.min(b, Math.max(a, v)); },
   trunc(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; },
+  /* Имена с пробелами/спецсимволами в формулах оборачиваются в кавычки */
+  quoteName(n) { return /[^A-Za-zА-Яа-яЁё_0-9]/.test(String(n)) ? '"' + n + '"' : String(n); },
+  /* Отображение значения любого типа */
+  fmtVal(v) {
+    if (typeof v === 'boolean') return v ? 'да' : 'нет';
+    if (typeof v === 'string') return U.trunc(v, 14);
+    return U.fmt(v);
+  },
   PALETTE_ENT: ['#4da3ff', '#e05c5c', '#06d6a0', '#ffd166', '#9b8cff', '#ff8c42', '#f472b6', '#38bdf8'],
   PALETTE_NODE: ['#ffd166', '#ef476f', '#06d6a0', '#4da3ff', '#9b8cff', '#ff8c42', '#f472b6', '#38bdf8'],
 };
@@ -26,11 +34,27 @@ const U = {
 /* ---------- нормализация данных (для импорта и защиты от битых данных) ---------- */
 
 function normParam(p) {
+  p = p || {};
+  const type = ['num', 'text', 'bool'].includes(p.type) ? p.type : 'num';
+  let value;
+  if (type === 'bool') value = !!p.value && p.value !== 'false';
+  else if (type === 'text') value = String(p.value === undefined ? '' : p.value);
+  else value = U.num(p.value, 0);
   return {
-    id: p && p.id || U.uid(),
-    name: String(p && p.name || 'параметр'),
-    value: U.num(p && p.value, 0),
+    id: p.id || U.uid(),
+    name: String(p.name || 'параметр'),
+    type,
+    value,
+    min: p.min === null || p.min === undefined || p.min === '' ? null : U.num(p.min, null),
+    max: p.max === null || p.max === undefined || p.max === '' ? null : U.num(p.max, null),
   };
+}
+
+/* Шанс хранится строкой: число (в процентах) или формула (результат в процентах) */
+function normChance(v) {
+  if (typeof v === 'number') return String(Math.round(v * 100));
+  if (v === undefined || v === null || v === '') return '100';
+  return String(v);
 }
 
 function normEffect(f) {
@@ -39,10 +63,10 @@ function normEffect(f) {
     id: f.id || U.uid(),
     targetEntityId: String(f.targetEntityId || ''),
     paramId: String(f.paramId || ''),
-    op: ['add', 'set', 'mul'].includes(f.op) ? f.op : 'add',
+    op: ['add', 'set', 'mul', 'toggle'].includes(f.op) ? f.op : 'add',
     value: String(f.value === undefined ? '0' : f.value),
     condition: String(f.condition || ''),
-    chance: U.clamp(U.num(f.chance, 1), 0, 1),
+    chance: normChance(f.chance),
     priority: U.num(f.priority, 0),
   };
 }
@@ -52,13 +76,16 @@ function normNode(n, idx) {
   return {
     id: n.id || U.uid(),
     name: String(n.name || 'Событие ' + (idx + 1)),
-    x: U.num(n.x, 40 + (idx % 3) * 210),
-    y: U.num(n.y, 40 + Math.floor(idx / 3) * 120),
+    // координаты всегда внутри прокручиваемого полотна дерева,
+    // иначе импортированные/битые ноды оказывались за его пределами
+    x: U.clamp(U.num(n.x, 40 + (idx % 3) * 210), -1900, 1800),
+    y: U.clamp(U.num(n.y, 40 + Math.floor(idx / 3) * 120), -1900, 1900),
     color: String(n.color || U.PALETTE_NODE[idx % U.PALETTE_NODE.length]),
     duration: Math.max(0, U.num(n.duration, 1)),
-    repeatChance: U.clamp(U.num(n.repeatChance, 0), 0, 1),
+    repeatChance: normChance(n.repeatChance),
     repeatCond: String(n.repeatCond || ''),
     repeatLimit: Math.max(0, Math.round(U.num(n.repeatLimit, 0))),
+    repeatPriority: U.num(n.repeatPriority, 0),
     effects: Array.isArray(n.effects) ? n.effects.map(normEffect) : [],
   };
 }
@@ -70,7 +97,7 @@ function normEdge(e) {
     from: String(e.from || ''),
     to: String(e.to || ''),
     condition: String(e.condition || ''),
-    chance: U.clamp(U.num(e.chance, 1), 0, 1),
+    chance: normChance(e.chance),
     priority: U.num(e.priority, 0),
   };
 }
@@ -144,14 +171,19 @@ const Store = {
             pages: s.pages.map(normPage),
             activePageId: s.activePageId || null,
             simSpeed: U.num(s.simSpeed, 1),
+            ui: Object.assign({ panelW: 480, logH: 180, stopCond: '' }, s.ui || {}),
           };
         }
       } catch (e) { console.warn('Не удалось прочитать сохранение', e); }
     }
     if (!this.state) {
       const demo = normPage(Demo.build());
-      this.state = { pages: [demo], activePageId: demo.id, simSpeed: 1 };
+      this.state = {
+        pages: [demo], activePageId: demo.id, simSpeed: 1,
+        ui: { panelW: 480, logH: 180, stopCond: '' },
+      };
     }
+    if (!this.state.ui) this.state.ui = { panelW: 480, logH: 180, stopCond: '' };
     if (!this.state.pages.some(p => p.id === this.state.activePageId)) {
       this.state.activePageId = this.state.pages[0].id;
     }
@@ -219,16 +251,81 @@ const Store = {
     }, null, 2);
   },
 
-  importAll(text) {
+  /* Уникальное имя страницы: при совпадении добавляет пометку «(дубль N)» */
+  uniquePageName(name) {
+    const names = new Set(this.state.pages.map(p => p.name));
+    if (!names.has(name)) return name;
+    let n = 2;
+    while (names.has(name + ' (дубль ' + n + ')')) n++;
+    return name + ' (дубль ' + n + ')';
+  },
+
+  /* Импорт БЕЗ затирания: страницы из файла добавляются к текущим.
+     Совпавшие названия получают пометку «(дубль N)».
+     Все id перегенерируются (копии не конфликтуют с оригиналами). */
+  importAppend(text) {
     const d = JSON.parse(text);
     if (!d || !Array.isArray(d.pages)) throw new Error('Неверный формат: ожидается файл GameFlow с массивом "pages"');
     const pages = d.pages.map(normPage);
     if (!pages.length) throw new Error('В файле нет страниц');
-    this.state.pages = pages;
-    this.state.activePageId = pages.some(p => p.id === d.activePageId) ? d.activePageId : pages[0].id;
+    const added = [];
+    for (const p of pages) {
+      const entMap = new Map(), parMap = new Map(), nodeMap = new Map();
+      const np = { id: U.uid(), name: this.uniquePageName(p.name), entities: [] };
+      // проход 1: сущности, параметры, ноды
+      for (const e of p.entities) {
+        const ne = {
+          id: U.uid(), name: e.name, x: e.x, y: e.y, color: e.color, enabled: e.enabled,
+          params: [], events: { nodes: [], edges: [], entryId: null, autoLoop: e.events.autoLoop },
+        };
+        entMap.set(e.id, ne.id);
+        for (const pa of e.params) { const npa = { ...pa, id: U.uid() }; parMap.set(pa.id, npa.id); ne.params.push(npa); }
+        for (const n of e.events.nodes) { const nn = { ...n, id: U.uid(), effects: [] }; nodeMap.set(n.id, nn.id); ne.events.nodes.push(nn); }
+        np.entities.push(ne);
+      }
+      // проход 2: воздействия, переходы, точка входа (по старым id)
+      for (const e of p.entities) {
+        const ne = np.entities.find(x => x.id === entMap.get(e.id));
+        for (const n of e.events.nodes) {
+          const nn = ne.events.nodes.find(x => x.id === nodeMap.get(n.id));
+          for (const f of n.effects) {
+            nn.effects.push({
+              ...f, id: U.uid(),
+              targetEntityId: entMap.get(f.targetEntityId) || f.targetEntityId,
+              paramId: parMap.get(f.paramId) || f.paramId,
+            });
+          }
+        }
+        for (const ed of e.events.edges) {
+          ne.events.edges.push({ ...ed, id: U.uid(), from: nodeMap.get(ed.from) || ed.from, to: nodeMap.get(ed.to) || ed.to });
+        }
+        ne.events.entryId = nodeMap.get(e.events.entryId) || null;
+      }
+      this.state.pages.push(np);
+      added.push(np);
+    }
+    this.state.activePageId = added[0].id;
     this.save();
-    return pages.length;
+    return added;
   },
+
+  /* Массово снять пометки «(дубль N)»: можно, если базовое имя уникально */
+  stripDupMarks(ids) {
+    const re = /^(.*) \(дубль \d+\)$/;
+    let count = 0;
+    for (const p of this.state.pages) {
+      if (ids && !ids.includes(p.id)) continue;
+      const m = p.name.match(re);
+      if (!m) continue;
+      const base = m[1];
+      const clash = this.state.pages.some(x => x.id !== p.id && x.name === base);
+      if (!clash) { p.name = base; count++; }
+    }
+    if (count) this.save();
+    return count;
+  },
+
+  importAll(text) { return this.importAppend(text); },
 };
 
 /* ---------- демо-схема ---------- */
@@ -240,9 +337,10 @@ const Demo = {
     const K = {
       id: U.uid(), name: 'Королевство', x: 300, y: 250, color: '#4da3ff', enabled: true,
       params: [
-        { id: U.uid(), name: 'золото', value: 100 },
-        { id: U.uid(), name: 'население', value: 50 },
-        { id: U.uid(), name: 'армия', value: 10 },
+        { id: U.uid(), name: 'золото', type: 'num', value: 100, min: 0, max: null },
+        { id: U.uid(), name: 'население', type: 'num', value: 50, min: 0, max: null },
+        { id: U.uid(), name: 'армия', type: 'num', value: 10, min: 0, max: null },
+        { id: U.uid(), name: 'правитель', type: 'text', value: 'король Альд', min: null, max: null },
       ],
       events: { nodes: [], edges: [], entryId: null, autoLoop: true },
     };
@@ -273,33 +371,36 @@ const Demo = {
     const V = {
       id: U.uid(), name: 'Враг', x: 820, y: 250, color: '#e05c5c', enabled: true,
       params: [
-        { id: U.uid(), name: 'армия', value: 18 },
-        { id: U.uid(), name: 'агрессия', value: 6 },
+        { id: U.uid(), name: 'армия', type: 'num', value: 18, min: 0, max: null },
+        { id: U.uid(), name: 'агрессия', type: 'num', value: 6, min: 0, max: 10 },
+        { id: U.uid(), name: 'в войне', type: 'bool', value: false, min: null, max: null },
       ],
       events: { nodes: [], edges: [], entryId: null, autoLoop: true },
     };
-    const [armV, agr] = V.params;
+    const [armV, agr, warV] = V.params;
 
     const e1 = {
       id: U.uid(), name: 'Разведка', x: 40, y: 40, color: '#9b8cff', duration: 4,
-      repeatChance: 0, repeatCond: '', repeatLimit: 0,
+      repeatChance: 0, repeatCond: '', repeatLimit: 0, repeatPriority: 0,
       effects: [
-        { id: U.uid(), targetEntityId: V.id, paramId: armV.id, op: 'add', value: 'round(rand(0,3))', condition: '', chance: 1, priority: 0 },
+        { id: U.uid(), targetEntityId: V.id, paramId: armV.id, op: 'add', value: 'round(rand(0,3))', condition: '', chance: '100', priority: 0 },
+        { id: U.uid(), targetEntityId: V.id, paramId: warV.id, op: 'set', value: '0', condition: '', chance: '100', priority: 0 },
       ],
     };
     const e2 = {
       id: U.uid(), name: 'Атака', x: 40, y: 260, color: '#ff6b4a', duration: 2,
-      repeatChance: 0.2, repeatCond: 'Королевство.армия > 0', repeatLimit: 2,
+      repeatChance: '20', repeatCond: 'Королевство.армия > 0', repeatLimit: 2, repeatPriority: 5,
       effects: [
-        { id: U.uid(), targetEntityId: K.id, paramId: nas.id, op: 'add', value: '-(5 + агрессия * 0.5)', condition: '', chance: 0.7, priority: 1 },
-        { id: U.uid(), targetEntityId: K.id, paramId: zol.id, op: 'add', value: '-20', condition: '', chance: 0.5, priority: 0 },
-        { id: U.uid(), targetEntityId: V.id, paramId: armV.id, op: 'add', value: '-round(rand(1,4))', condition: '', chance: 1, priority: 0 },
+        { id: U.uid(), targetEntityId: K.id, paramId: nas.id, op: 'add', value: '-(5 + агрессия * 0.5)', condition: '', chance: '70', priority: 1 },
+        { id: U.uid(), targetEntityId: K.id, paramId: zol.id, op: 'add', value: '-20', condition: '', chance: '50', priority: 0 },
+        { id: U.uid(), targetEntityId: V.id, paramId: armV.id, op: 'add', value: '-round(rand(1,4))', condition: '', chance: '100', priority: 0 },
+        { id: U.uid(), targetEntityId: V.id, paramId: warV.id, op: 'set', value: '1', condition: '', chance: '100', priority: 0 },
       ],
     };
     V.events.nodes = [e1, e2];
     V.events.edges = [
-      { id: U.uid(), from: e1.id, to: e2.id, condition: 'Королевство.армия < армия', chance: 0.8, priority: 1 },
-      { id: U.uid(), from: e2.id, to: e1.id, condition: '', chance: 1, priority: 0 },
+      { id: U.uid(), from: e1.id, to: e2.id, condition: 'Королевство.армия < армия && Враг."в войне" == 0', chance: '80', priority: 1 },
+      { id: U.uid(), from: e2.id, to: e1.id, condition: '', chance: '100', priority: 0 },
     ];
     V.events.entryId = e1.id;
 

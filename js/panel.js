@@ -1,15 +1,22 @@
 'use strict';
 /* ============================================================
-   Panel — правая панель: параметры сущности, редактор дерева
-   событий (drag-n-drop нод, связи через порт), инспектор ноды
-   (воздействия, переходы, повторы) и панель воздействий на
-   параметр (кто и как меняет параметр + приоритеты).
+   Panel — правая панель: параметры сущности (тип, старт, min/max,
+   текущее), редактор дерева событий на бесконечном полотне
+   (drag-n-drop нод, связи через порт, прокрутка в любые стороны),
+   инспектор ноды (воздействия с шансами-формулами, переходы,
+   повторы с приоритетом) и панель воздействий на параметр.
+   Позиции прокрутки сохраняются между перерисовками и вкладками.
    ============================================================ */
+
+const TREE_OFF = 2000;   // смещение мира дерева в координаты svg (полотно 4000×4000)
+const TREE_SIZE = 4000;
 
 const Panel = {
   el: null,
-  NW: 150, NH: 52,   // размер ноды дерева
-  _tree: null,       // состояние drag/link в дереве
+  NW: 150, NH: 52,
+  _tree: null,
+  _scrollMem: {},
+  _curKey: null,
 
   init() {
     this.el = document.getElementById('panel');
@@ -18,13 +25,31 @@ const Panel = {
     this.el.addEventListener('change', e => this._onInput(e));
   },
 
+  /* ================= прокрутка ================= */
+
+  _captureScrolls() {
+    const caps = {};
+    const pb = this.el.querySelector('.p-body');
+    if (pb) caps.pb = pb.scrollTop;
+    const ts = this.el.querySelector('.tree-scroll');
+    if (ts) caps.ts = [ts.scrollLeft, ts.scrollTop];
+    const ins = document.getElementById('inspector');
+    if (ins) caps.ins = ins.scrollTop;
+    return caps;
+  },
+
   /* ================= рендер ================= */
 
   render() {
     const sel = App.sel;
-    if (sel.impact) { this.renderImpact(); return; }
+    const prevKey = this._curKey;
+    const caps = this._captureScrolls();
+    if (prevKey) this._scrollMem[prevKey] = caps;
+
+    if (sel.impact) { this._curKey = 'impact'; this.renderImpact(); this._restoreScrolls('impact'); return; }
     const ent = sel.entityId ? Store.entity(sel.entityId) : null;
     if (!ent) {
+      this._curKey = 'none';
       MapView.setHighlight(null);
       this.el.innerHTML =
         '<div class="panel-hint">' +
@@ -51,28 +76,53 @@ const Panel = {
       '</div>' +
       '<div class="p-body">' + (sel.tab === 'params' ? this._paramsHTML(ent) : this._eventsHTML(ent)) + '</div>';
 
+    this._curKey = sel.tab;
     if (sel.tab === 'events') {
-      this.renderTree(ent);
+      const memTs = this._scrollMem.events && this._scrollMem.events.ts;
+      this.renderTree(ent, memTs);
       this.renderInspector(ent);
     }
+    this._restoreScrolls(sel.tab);
+  },
+
+  _restoreScrolls(key) {
+    const m = this._scrollMem[key];
+    const pb = this.el.querySelector('.p-body');
+    if (pb && m && m.pb) pb.scrollTop = m.pb;
+    const ins = document.getElementById('inspector');
+    if (ins && m && m.ins) ins.scrollTop = m.ins;
   },
 
   _paramsHTML(ent) {
-    const rows = ent.params.map(p => {
+    const cards = ent.params.map(p => {
       const v = Engine.values[p.id] !== undefined ? Engine.values[p.id] : p.value;
-      return '<tr>' +
-        '<td><input class="inp" data-inp="param-name" data-id="' + p.id + '" value="' + U.esc(p.name) + '"></td>' +
-        '<td><input class="inp num" type="number" step="any" data-inp="param-start" data-id="' + p.id + '" value="' + p.value + '" title="Стартовое значение"></td>' +
-        '<td><span class="cur-val" id="pv-' + p.id + '">' + U.fmt(v) + '</span></td>' +
-        '<td><button class="ibtn" data-act="param-impact" data-id="' + p.id + '" title="Кто меняет этот параметр?">🔍</button></td>' +
-        '<td><button class="ibtn danger" data-act="param-del" data-id="' + p.id + '" title="Удалить параметр">✕</button></td>' +
-      '</tr>';
+      let start;
+      if (p.type === 'bool') start = '<label class="chk"><input type="checkbox" data-inp="param-start" data-id="' + p.id + '" ' + (p.value ? 'checked' : '') + '> старт</label>';
+      else if (p.type === 'text') start = '<input class="inp" data-inp="param-start" data-id="' + p.id + '" value="' + U.esc(p.value) + '">';
+      else start = '<input class="inp num" type="number" step="any" data-inp="param-start" data-id="' + p.id + '" value="' + p.value + '" title="Стартовое значение">';
+      const mm = p.type === 'num'
+        ? '<label>мин <input class="inp num" type="number" step="any" data-inp="param-min" data-id="' + p.id + '" value="' + (p.min === null || p.min === undefined ? '' : p.min) + '"></label>' +
+          '<label>макс <input class="inp num" type="number" step="any" data-inp="param-max" data-id="' + p.id + '" value="' + (p.max === null || p.max === undefined ? '' : p.max) + '"></label>'
+        : '<span class="dim">' + (p.type === 'bool' ? 'да / нет' : 'текст') + '</span>';
+      return '<div class="p-row">' +
+        '<div class="p-row1">' +
+          '<input class="inp name" data-inp="param-name" data-id="' + p.id + '" value="' + U.esc(p.name) + '" title="Имя параметра (в формулах имена с пробелами — в кавычках: &quot;имя&quot;)">' +
+          '<select class="inp type-sel" data-inp="param-type" data-id="' + p.id + '" title="Тип параметра">' +
+            '<option value="num"' + (p.type === 'num' ? ' selected' : '') + '>число</option>' +
+            '<option value="text"' + (p.type === 'text' ? ' selected' : '') + '>текст</option>' +
+            '<option value="bool"' + (p.type === 'bool' ? ' selected' : '') + '>булев</option>' +
+          '</select>' +
+          '<span class="cur-val" id="pv-' + p.id + '" title="Текущее значение">' + U.fmtVal(v) + '</span>' +
+          '<button class="ibtn" data-act="param-impact" data-id="' + p.id + '" title="Кто меняет этот параметр?">🔍</button>' +
+          '<button class="ibtn danger" data-act="param-del" data-id="' + p.id + '" title="Удалить параметр">✕</button>' +
+        '</div>' +
+        '<div class="p-row2"><span class="dim">старт:</span>' + start + mm + '</div>' +
+      '</div>';
     }).join('');
     return '<div class="p-scroll">' +
-      '<table class="ptable"><thead><tr><th>Параметр</th><th title="Значение на старте симуляции">Старт</th><th title="Текущее значение">Текущее</th><th></th><th></th></tr></thead>' +
-      '<tbody>' + (rows || '<tr><td colspan="5" class="empty">Нет параметров</td></tr>') + '</tbody></table>' +
+      (cards || '<div class="insp-empty">Нет параметров</div>') +
       '<button class="tbtn" data-act="add-param">＋ Параметр</button>' +
-      '<div class="hint">В формулах событий параметры доступны как <code>имя</code> (свои) или <code>Сущность.имя</code> (глобально). Клик по 🔍 — панель воздействий на параметр.</div>' +
+      '<div class="hint">В формулах событий параметры доступны как <code>имя</code> (свои) или <code>Сущность.имя</code> (глобально); имена с пробелами — в кавычках: <code>"в войне"</code>. При вводе формулы появляется список автоподстановки. Клик по 🔍 — панель воздействий.</div>' +
       '</div>';
   },
 
@@ -80,26 +130,28 @@ const Panel = {
     const en = ent.events;
     const opts = en.nodes.map(n =>
       '<option value="' + n.id + '" ' + (n.id === en.entryId ? 'selected' : '') + '>' + U.esc(U.trunc(n.name, 18)) + '</option>').join('');
+    const jumpOpts = en.nodes.map(n =>
+      '<option value="' + n.id + '" ' + (n.id === App.sel.nodeId ? 'selected' : '') + '>' + U.esc(U.trunc(n.name, 22)) + '</option>').join('');
     return '' +
       '<div class="ev-toolbar">' +
         '<button class="tbtn" data-act="add-node">＋ Событие</button>' +
         '<label class="chk" title="Если нет доступных переходов — возврат в точку входа"><input type="checkbox" data-inp="autoloop" ' + (en.autoLoop ? 'checked' : '') + '>Автоцикл</label>' +
         '<label class="entry-lbl" title="Стартовая нода и точка возврата при автоцикле">Вход: <select data-inp="entry">' + (opts || '<option value="">—</option>') + '</select></label>' +
+        '<label class="entry-lbl" title="Показать на полотне и открыть настройки события (работает даже если нода далеко за пределами экрана)">Событие: <select data-inp="jump-node"><option value="">— выбрать —</option>' + jumpOpts + '</select></label>' +
       '</div>' +
-      '<div class="tree-scroll"><svg id="treeSvg" width="960" height="460"></svg></div>' +
-      '<div class="hint tree-hint">Двойной клик по полю — новое событие · клик по ноде — настройки · тяните от <span class="port-ico">◆</span> к другой ноде — создать переход</div>' +
+      '<div class="tree-scroll"><svg id="treeSvg" width="' + TREE_SIZE + '" height="' + TREE_SIZE + '"></svg></div>' +
+      '<div class="hint tree-hint">Двойной клик по полю — новое событие · клик по ноде — настройки · тяните от <span class="port-ico">◆</span> к другой ноде — создать переход · полотно прокручивается в любые стороны</div>' +
       '<div id="inspector"></div>';
   },
 
   /* ================= дерево событий ================= */
 
-  renderTree(ent) {
+  renderTree(ent, savedScroll, centerOn) {
     const svg = document.getElementById('treeSvg');
     if (!svg) return;
     const en = ent.events;
     svg.innerHTML = '';
 
-    // маркеры по цветам нод
     let defs = '<defs>';
     const colors = new Set(en.nodes.map(n => n.color || '#8b98ad'));
     for (const c of colors) {
@@ -107,24 +159,22 @@ const Panel = {
     }
     defs += '</defs>';
     svg.insertAdjacentHTML('beforeend', defs);
-    svg.insertAdjacentHTML('beforeend', '<rect class="tree-bg" x="0" y="0" width="960" height="460" fill="transparent"/>');
+    svg.insertAdjacentHTML('beforeend', '<rect class="tree-bg" x="0" y="0" width="' + TREE_SIZE + '" height="' + TREE_SIZE + '" fill="transparent"/>');
 
     const gE = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     const gN = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     svg.appendChild(gE); svg.appendChild(gN);
 
-    // рёбра
     this._drawTreeEdges(ent, gE);
 
-    // ноды
     for (const n of en.nodes) {
       const sel = App.sel.nodeId === n.id ? ' sel' : '';
       const entry = en.entryId === n.id ? ' entry' : '';
       const act = (App.sel.entityId === ent.id && Engine.activeNode(ent.id) === n.id) ? ' act' : '';
       const sub = '⏱ ' + U.fmt(n.duration) + 'с · ↯ ' + n.effects.length +
-        (n.repeatChance > 0 ? ' · ⟳ ' + Math.round(n.repeatChance * 100) + '%' : '');
+        (parseFloat(n.repeatChance) > 0 || !/^\d+(\.\d+)?$/.test(String(n.repeatChance).trim()) ? ' · ⟳ ' + n.repeatChance + '%' : '');
       gN.insertAdjacentHTML('beforeend',
-        '<g class="tnode' + sel + entry + act + '" data-id="' + n.id + '" transform="translate(' + n.x + ',' + n.y + ')">' +
+        '<g class="tnode' + sel + entry + act + '" data-id="' + n.id + '" transform="translate(' + (n.x + TREE_OFF) + ',' + (n.y + TREE_OFF) + ')">' +
           '<rect class="tnode-body" width="' + this.NW + '" height="' + this.NH + '" rx="9" style="stroke:' + (n.color || '#8b98ad') + '"/>' +
           '<rect class="tnode-bar" width="7" height="' + this.NH + '" rx="3.5" fill="' + (n.color || '#8b98ad') + '"/>' +
           '<text class="tnode-name" x="15" y="21">' + U.esc(U.trunc(n.name, 17)) + '</text>' +
@@ -134,7 +184,27 @@ const Panel = {
         '</g>');
     }
 
-    this._bindTree(svg, ent);
+    // прокрутка: сохранённая позиция или центрирование на нужной ноде/точке входа
+    const ts = svg.parentElement;
+    if (savedScroll && !centerOn) {
+      ts.scrollLeft = savedScroll[0];
+      ts.scrollTop = savedScroll[1];
+    } else {
+      const focus = (centerOn && en.nodes.find(n => n.id === centerOn)) ||
+        en.nodes.find(n => n.id === en.entryId) || en.nodes[0];
+      const cx = (focus ? focus.x : 0) + TREE_OFF + this.NW / 2;
+      const cy = (focus ? focus.y : 0) + TREE_OFF + this.NH / 2;
+      ts.scrollLeft = Math.max(0, cx - ts.clientWidth / 2);
+      ts.scrollTop = Math.max(0, cy - ts.clientHeight / 2);
+    }
+
+    // слушатели вешаются один раз на жизнь svg-элемента,
+    // иначе повторные renderTree накапливают обработчики
+    // (dblclick создавал бы несколько нод подряд)
+    if (!svg._gfBound) {
+      this._bindTree(svg, ent);
+      svg._gfBound = true;
+    }
   },
 
   _drawTreeEdges(ent, gE) {
@@ -148,13 +218,13 @@ const Panel = {
       const color = sn.color || '#8b98ad';
       const parts = [];
       if (ed.condition) parts.push(U.trunc(ed.condition, 16));
-      if (ed.chance < 1) parts.push(Math.round(ed.chance * 100) + '%');
+      if (String(ed.chance) !== '100') parts.push(ed.chance + '%');
       if (ed.priority) parts.push('пр' + ed.priority);
       const label = parts.join(' · ');
-      const mx = (a1.x + a2.x) / 2, my = (a1.y + a2.y) / 2;
+      const mx = (a1.x + a2.x) / 2 + TREE_OFF, my = (a1.y + a2.y) / 2 + TREE_OFF;
       gE.insertAdjacentHTML('beforeend',
         '<g class="tedge" data-id="' + ed.id + '">' +
-          '<line x1="' + a1.x + '" y1="' + a1.y + '" x2="' + a2.x + '" y2="' + a2.y + '" stroke="' + color + '" marker-end="url(#tmk-' + color.replace('#', '') + ')"/>' +
+          '<line x1="' + (a1.x + TREE_OFF) + '" y1="' + (a1.y + TREE_OFF) + '" x2="' + (a2.x + TREE_OFF) + '" y2="' + (a2.y + TREE_OFF) + '" stroke="' + color + '" marker-end="url(#tmk-' + color.replace('#', '') + ')"/>' +
           (label ? '<text class="tedge-label" x="' + mx + '" y="' + (my - 6) + '" text-anchor="middle">' + U.esc(label) + '</text>' : '') +
           '<g class="edel" data-act="edge-del" data-id="' + ed.id + '" transform="translate(' + mx + ',' + (my + 8) + ')"><circle r="7.5"/><text y="3.5" text-anchor="middle">✕</text></g>' +
         '</g>');
@@ -184,7 +254,6 @@ const Panel = {
       const port = e.target.closest('.tport');
       const nodeG = e.target.closest('.tnode');
       if (port && nodeG) {
-        // начало создания связи
         e.stopPropagation();
         svg.setPointerCapture(e.pointerId);
         const p = self._treePoint(svg, e);
@@ -198,7 +267,6 @@ const Panel = {
         return;
       }
       if (nodeG && !e.target.closest('.edel')) {
-        // выбор + перетаскивание ноды
         const id = nodeG.dataset.id;
         const node = ent.events.nodes.find(n => n.id === id);
         if (!node) return;
@@ -223,9 +291,9 @@ const Panel = {
         const node = ent.events.nodes.find(n => n.id === st.id);
         if (!node) return;
         if (Math.abs(p.x - st.sx) + Math.abs(p.y - st.sy) > 2) st.moved = true;
-        node.x = U.clamp(Math.round(st.ox + p.x - st.sx), 0, 960 - self.NW);
-        node.y = U.clamp(Math.round(st.oy + p.y - st.sy), 0, 460 - self.NH);
-        st.g.setAttribute('transform', 'translate(' + node.x + ',' + node.y + ')');
+        node.x = U.clamp(Math.round(st.ox + p.x - st.sx), -TREE_OFF, TREE_SIZE - TREE_OFF - self.NW);
+        node.y = U.clamp(Math.round(st.oy + p.y - st.sy), -TREE_OFF, TREE_SIZE - TREE_OFF - self.NH);
+        st.g.setAttribute('transform', 'translate(' + (node.x + TREE_OFF) + ',' + (node.y + TREE_OFF) + ')');
         const gE = svg.querySelector('g');
         gE.innerHTML = '';
         self._drawTreeEdges(ent, gE);
@@ -244,12 +312,13 @@ const Panel = {
       } else if (st.mode === 'link') {
         st.line.remove();
         const p = self._treePoint(svg, e);
+        const wx = p.x - TREE_OFF, wy = p.y - TREE_OFF;
         const target = ent.events.nodes.find(n =>
-          p.x >= n.x && p.x <= n.x + self.NW && p.y >= n.y && p.y <= n.y + self.NH);
+          wx >= n.x && wx <= n.x + self.NW && wy >= n.y && wy <= n.y + self.NH);
         if (target && target.id !== st.from) {
           const exists = ent.events.edges.some(ed => ed.from === st.from && ed.to === target.id);
           if (!exists) {
-            ent.events.edges.push({ id: U.uid(), from: st.from, to: target.id, condition: '', chance: 1, priority: 0 });
+            ent.events.edges.push({ id: U.uid(), from: st.from, to: target.id, condition: '', chance: '100', priority: 0 });
             Store.save();
             App.onDataChange();
           }
@@ -264,8 +333,8 @@ const Panel = {
       const node = normNode({
         id: U.uid(),
         name: 'Событие ' + (idx + 1),
-        x: U.clamp(Math.round(p.x - self.NW / 2), 0, 960 - self.NW),
-        y: U.clamp(Math.round(p.y - self.NH / 2), 0, 460 - self.NH),
+        x: Math.round(p.x - TREE_OFF - self.NW / 2),
+        y: Math.round(p.y - TREE_OFF - self.NH / 2),
         color: U.PALETTE_NODE[idx % U.PALETTE_NODE.length],
         duration: 1, effects: [],
       }, idx);
@@ -279,6 +348,14 @@ const Panel = {
 
   /* ================= инспектор ноды ================= */
 
+  _opOptions(type, cur) {
+    const opts = type === 'bool' ? [['set', '= (по формуле)'], ['toggle', 'инверсия']]
+      : type === 'text' ? [['set', '= (текст)']]
+      : [['add', '+='], ['set', '='], ['mul', '×=']];
+    if (!opts.some(o => o[0] === cur)) cur = opts[0][0];
+    return { html: opts.map(o => '<option value="' + o[0] + '" ' + (o[0] === cur ? 'selected' : '') + '>' + o[1] + '</option>').join(''), cur };
+  },
+
   renderInspector(ent) {
     const box = document.getElementById('inspector');
     if (!box) return;
@@ -289,9 +366,12 @@ const Panel = {
     }
     const page = Store.page();
 
-    // эффекты
     const fxRows = node.effects.map(f => {
       const te = Store.entity(f.targetEntityId) || ent;
+      const tp = te.params.find(p => p.id === f.paramId);
+      const type = tp ? tp.type : 'num';
+      const ops = this._opOptions(type, f.op);
+      f.op = ops.cur;
       const pOpts = te.params.map(p => '<option value="' + p.id + '" ' + (p.id === f.paramId ? 'selected' : '') + '>' + U.esc(p.name) + '</option>').join('');
       return '<div class="fx-row" data-fx="' + f.id + '">' +
         '<div class="fx-line1">' +
@@ -299,25 +379,20 @@ const Panel = {
             page.entities.map(e => '<option value="' + e.id + '" ' + (e.id === f.targetEntityId ? 'selected' : '') + '>' + U.esc(U.trunc(e.name, 14)) + '</option>').join('') +
           '</select>' +
           '<select class="inp" data-inp="fx-field" data-fx="' + f.id + '" data-f="paramId" title="Целевой параметр">' + (pOpts || '<option value="">—</option>') + '</select>' +
-          '<select class="inp op" data-inp="fx-field" data-fx="' + f.id + '" data-f="op" title="Операция">' +
-            '<option value="add" ' + (f.op === 'add' ? 'selected' : '') + '>+=</option>' +
-            '<option value="set" ' + (f.op === 'set' ? 'selected' : '') + '>=</option>' +
-            '<option value="mul" ' + (f.op === 'mul' ? 'selected' : '') + '>×=</option>' +
-          '</select>' +
+          '<select class="inp op" data-inp="fx-field" data-fx="' + f.id + '" data-f="op" title="Операция (зависит от типа параметра)">' + ops.html + '</select>' +
           '<button class="ibtn danger" data-act="fx-del" data-id="' + f.id + '" title="Удалить воздействие">✕</button>' +
         '</div>' +
         '<div class="fx-line2">' +
-          '<input class="inp fx-val" data-inp="fx-field" data-fx="' + f.id + '" data-f="value" value="' + U.esc(f.value) + '" placeholder="число или формула, напр. 10 + золото*0.1" title="Величина изменения">' +
+          '<input class="inp fx-val ac" data-inp="fx-field" data-fx="' + f.id + '" data-f="value" value="' + U.esc(f.value) + '" placeholder="' + (type === 'text' ? 'текст для присваивания' : 'число или формула, напр. 10 + золото*0.1') + '" title="Величина изменения">' +
         '</div>' +
         '<div class="fx-line3">' +
-          '<input class="inp fx-cond" data-inp="fx-field" data-fx="' + f.id + '" data-f="condition" value="' + U.esc(f.condition) + '" placeholder="условие (напр. золото &lt; 100)" title="Условие срабатывания">' +
-          '<label title="Вероятность срабатывания">шанс<input class="inp num" type="number" min="0" max="100" step="5" data-inp="fx-field" data-fx="' + f.id + '" data-f="chance" value="' + Math.round(f.chance * 100) + '">%</label>' +
+          '<input class="inp fx-cond ac" data-inp="fx-field" data-fx="' + f.id + '" data-f="condition" value="' + U.esc(f.condition) + '" placeholder="условие (напр. золото &lt; 100)" title="Условие срабатывания">' +
+          '<label title="Шанс срабатывания: число в % или формула (результат в %)">шанс<input class="inp chance ac" data-inp="fx-field" data-fx="' + f.id + '" data-f="chance" value="' + U.esc(f.chance) + '" placeholder="%"></label>' +
           '<label title="Приоритет: при одновременном изменении одного параметра первым применяется больший приоритет">приор.<input class="inp num" type="number" step="1" data-inp="fx-field" data-fx="' + f.id + '" data-f="priority" value="' + f.priority + '"></label>' +
         '</div>' +
       '</div>';
     }).join('');
 
-    // исходящие переходы
     const en = ent.events;
     const edRows = en.edges.filter(ed => ed.from === node.id).map(ed => {
       return '<div class="ed-row">' +
@@ -325,8 +400,8 @@ const Panel = {
         '<select class="inp" data-inp="edge-field" data-id="' + ed.id + '" data-f="to">' +
           en.nodes.map(n => '<option value="' + n.id + '" ' + (n.id === ed.to ? 'selected' : '') + '>' + U.esc(U.trunc(n.name, 14)) + '</option>').join('') +
         '</select>' +
-        '<input class="inp ed-cond" data-inp="edge-field" data-id="' + ed.id + '" data-f="condition" value="' + U.esc(ed.condition) + '" placeholder="условие">' +
-        '<label>шанс<input class="inp num" type="number" min="0" max="100" step="5" data-inp="edge-field" data-id="' + ed.id + '" data-f="chance" value="' + Math.round(ed.chance * 100) + '">%</label>' +
+        '<input class="inp ed-cond ac" data-inp="edge-field" data-id="' + ed.id + '" data-f="condition" value="' + U.esc(ed.condition) + '" placeholder="условие">' +
+        '<label title="Число в % или формула (результат в %)">шанс<input class="inp chance ac" data-inp="edge-field" data-id="' + ed.id + '" data-f="chance" value="' + U.esc(ed.chance) + '" placeholder="%"></label>' +
         '<label>приор.<input class="inp num" type="number" step="1" data-inp="edge-field" data-id="' + ed.id + '" data-f="priority" value="' + ed.priority + '"></label>' +
         '<button class="ibtn danger" data-act="edge-del" data-id="' + ed.id + '" title="Удалить переход">✕</button>' +
       '</div>';
@@ -340,11 +415,12 @@ const Panel = {
           '<label>Цвет<input type="color" class="color-inp" data-inp="node-field" data-f="color" value="' + (node.color || '#ffd166') + '"></label>' +
           '<label title="Сколько секунд занимает событие">Длительность, с<input class="inp num" type="number" min="0" step="0.1" data-inp="node-field" data-f="duration" value="' + node.duration + '"></label>' +
         '</div>' +
-        '<fieldset><legend>Повтор события</legend>' +
+        '<fieldset><legend>Повтор события (конкурирует с переходами по приоритету)</legend>' +
           '<div class="insp-grid">' +
-            '<label>Шанс %<input class="inp num" type="number" min="0" max="100" step="5" data-inp="node-field" data-f="repeatChance" value="' + Math.round(node.repeatChance * 100) + '"></label>' +
+            '<label title="Число в % или формула (результат в %)">Шанс %<input class="inp chance ac" data-inp="node-field" data-f="repeatChance" value="' + U.esc(node.repeatChance) + '" placeholder="0 или формула"></label>' +
+            '<label title="Приоритет повтора относительно переходов в другие события">Приоритет<input class="inp num" type="number" step="1" data-inp="node-field" data-f="repeatPriority" value="' + (node.repeatPriority || 0) + '"></label>' +
             '<label>Лимит (0 = ∞)<input class="inp num" type="number" min="0" step="1" data-inp="node-field" data-f="repeatLimit" value="' + node.repeatLimit + '"></label>' +
-            '<label class="wide">Условие повтора<input class="inp" data-inp="node-field" data-f="repeatCond" value="' + U.esc(node.repeatCond) + '" placeholder="напр. враг.армия > 0"></label>' +
+            '<label class="wide">Условие повтора<input class="inp ac" data-inp="node-field" data-f="repeatCond" value="' + U.esc(node.repeatCond) + '" placeholder="напр. враг.армия > 0"></label>' +
           '</div>' +
         '</fieldset>' +
         '<fieldset><legend>Воздействия (' + node.effects.length + ')</legend>' +
@@ -373,7 +449,16 @@ const Panel = {
       if (r.ok) { input.classList.remove('bad'); input.title = 'OK (сейчас = ' + U.fmt(r.value) + ')'; }
       else { input.classList.add('bad'); input.title = 'Ошибка: ' + r.error; }
     };
+    const checkChance = input => {
+      const src = input.value.trim();
+      if (!src) { input.classList.remove('bad'); input.title = 'Пусто = 100%'; return; }
+      if (/^-?\d+(\.\d+)?$/.test(src)) { input.classList.remove('bad'); input.title = 'Шанс ' + U.clamp(parseFloat(src), 0, 100) + '%'; return; }
+      const r = Formula.eval(src, resolver);
+      if (r.ok) { input.classList.remove('bad'); input.title = 'OK: формула даёт шанс ' + U.fmt(U.clamp(r.value, 0, 100)) + '%'; }
+      else { input.classList.add('bad'); input.title = 'Ошибка: ' + r.error; }
+    };
     document.querySelectorAll('#inspector [data-f="value"], #inspector [data-f="condition"], #inspector [data-f="repeatCond"]').forEach(check);
+    document.querySelectorAll('#inspector [data-f="chance"], #inspector [data-f="repeatChance"]').forEach(checkChance);
   },
 
   /* ================= панель воздействий ================= */
@@ -392,14 +477,14 @@ const Panel = {
         for (const fx of n.effects)
           if (fx.targetEntityId === ent.id && fx.paramId === param.id) rows.push({ e2, n, fx });
 
-    // подсветка карты
     const entityIds = new Set(rows.map(r => r.e2.id));
     entityIds.add(ent.id);
     const nodeIds = new Set(rows.map(r => r.n.id));
     MapView.setHighlight({ entityIds, nodeIds });
 
     const cur = Engine.values[param.id] !== undefined ? Engine.values[param.id] : param.value;
-    const opLabel = { add: '+=', set: '=', mul: '×=' };
+    const typeName = { num: 'число', text: 'текст', bool: 'булев' }[param.type] || 'число';
+    const opLabel = { add: '+=', set: '=', mul: '×=', toggle: 'инверсия' };
 
     const cards = rows.map(r =>
       '<div class="imp-card">' +
@@ -408,7 +493,7 @@ const Panel = {
         '<div class="imp-body">' +
           '<code class="imp-op">' + opLabel[r.fx.op] + ' ' + U.esc(r.fx.value) + '</code>' +
           (r.fx.condition ? '<div class="imp-meta">если <code>' + U.esc(r.fx.condition) + '</code></div>' : '') +
-          (r.fx.chance < 1 ? '<div class="imp-meta">шанс ' + Math.round(r.fx.chance * 100) + '%</div>' : '') +
+          (String(r.fx.chance) !== '100' ? '<div class="imp-meta">шанс ' + U.esc(r.fx.chance) + '%</div>' : '') +
         '</div>' +
         '<div class="imp-foot">' +
           '<label title="Приоритет применения при одновременном изменении">приоритет ' +
@@ -424,7 +509,9 @@ const Panel = {
         '<b class="imp-title">🔍 Воздействия на «' + U.esc(param.name) + '»</b>' +
       '</div>' +
       '<div class="p-body"><div class="p-scroll">' +
-        '<div class="imp-summary">Сущность <b style="color:' + ent.color + '">' + U.esc(ent.name) + '</b> · старт: <b>' + U.fmt(param.value) + '</b> · текущее: <b id="imp-cur">' + U.fmt(cur) + '</b> · источников: <b>' + rows.length + '</b></div>' +
+        '<div class="imp-summary">Сущность <b style="color:' + ent.color + '">' + U.esc(ent.name) + '</b> · тип: <b>' + typeName + '</b> · старт: <b>' + U.fmtVal(param.value) + '</b> · текущее: <b id="imp-cur">' + U.fmtVal(cur) + '</b>' +
+        (param.type === 'num' && (param.min !== null || param.max !== null) ? ' · границы: <b>' + (param.min === null ? '−∞' : param.min) + ' … ' + (param.max === null ? '+∞' : param.max) + '</b>' : '') +
+        ' · источников: <b>' + rows.length + '</b></div>' +
         (cards || '<div class="insp-empty">Этот параметр пока нигде не изменяется.</div>') +
         '<div class="hint">Приоритет определяет порядок применения, когда несколько источников меняют параметр одновременно (больший — раньше). Карта подсвечивает только связанные сущности и события.</div>' +
       '</div></div>';
@@ -434,9 +521,9 @@ const Panel = {
 
   updateParamValue(paramId, val) {
     const el = document.getElementById('pv-' + paramId);
-    if (el && document.activeElement !== el) el.textContent = U.fmt(val);
+    if (el && document.activeElement !== el) el.textContent = U.fmtVal(val);
     const cur = document.getElementById('imp-cur');
-    if (cur && App.sel.impact && App.sel.impact.paramId === paramId) cur.textContent = U.fmt(val);
+    if (cur && App.sel.impact && App.sel.impact.paramId === paramId) cur.textContent = U.fmtVal(val);
   },
 
   markActive(entityId, nodeId, on) {
@@ -453,7 +540,7 @@ const Panel = {
     }
   },
 
-  /* ================= обработка ввода (делегирование) ================= */
+  /* ================= обработка ввода ================= */
 
   _onInput(e) {
     const t = e.target;
@@ -481,30 +568,61 @@ const Panel = {
         if (p) { p.name = t.value; Store.save(); MapView.render(); }
         break;
       }
+      case 'param-type': {
+        const p = ent.params.find(x => x.id === id);
+        if (!p) break;
+        const old = p.value;
+        p.type = t.value;
+        if (p.type === 'bool') p.value = old === true || old === 'true' || U.num(old, 0) !== 0;
+        else if (p.type === 'text') p.value = String(old === true ? 'да' : old === false ? 'нет' : old);
+        else p.value = U.num(old === true ? 1 : old === false ? 0 : old, 0);
+        if (!Engine.running) Engine.values[p.id] = p.value;
+        Store.save(); this.render(); MapView.render();
+        break;
+      }
       case 'param-start': {
         const p = ent.params.find(x => x.id === id);
-        if (p) {
+        if (!p) break;
+        if (p.type === 'bool') p.value = t.checked;
+        else if (p.type === 'text') p.value = t.value;
+        else {
           p.value = U.num(t.value, p.value);
-          if (!Engine.running) { Engine.values[p.id] = p.value; this.updateParamValue(p.id, p.value); MapView.updateValue(p.id, p.value); }
-          Store.save();
+          if (p.min !== null && p.min !== undefined) p.value = Math.max(p.min, p.value);
+          if (p.max !== null && p.max !== undefined) p.value = Math.min(p.max, p.value);
         }
+        if (!Engine.running) { Engine.values[p.id] = p.value; this.updateParamValue(p.id, p.value); MapView.updateValue(p.id, p.value); }
+        Store.save();
+        break;
+      }
+      case 'param-min': case 'param-max': {
+        const p = ent.params.find(x => x.id === id);
+        if (!p) break;
+        p[f === 'param-min' ? 'min' : 'max'] = t.value === '' ? null : U.num(t.value, null);
+        Store.save();
         break;
       }
       case 'autoloop':
         ent.events.autoLoop = t.checked; Store.save(); break;
+      case 'jump-node': {
+        sel.nodeId = t.value || null;
+        this.renderTree(ent, null, t.value || undefined);
+        this.renderInspector(ent);
+        break;
+      }
       case 'entry':
-        ent.events.entryId = t.value || null; Store.save(); this.renderTree(ent); break;
+        ent.events.entryId = t.value || null; Store.save(); this.renderTree(ent, this._scrollMem.events && this._scrollMem.events.ts); break;
       case 'node-field': {
         const n = ent.events.nodes.find(x => x.id === sel.nodeId);
         if (!n) break;
         if (f === 'name') n.name = t.value;
         else if (f === 'color') n.color = t.value;
         else if (f === 'duration') n.duration = Math.max(0, U.num(t.value, 0));
-        else if (f === 'repeatChance') n.repeatChance = U.clamp(U.num(t.value, 0) / 100, 0, 1);
+        else if (f === 'repeatChance') n.repeatChance = t.value;
         else if (f === 'repeatCond') n.repeatCond = t.value;
         else if (f === 'repeatLimit') n.repeatLimit = Math.max(0, Math.round(U.num(t.value, 0)));
+        else if (f === 'repeatPriority') n.repeatPriority = U.num(t.value, 0);
         Store.save();
-        this.renderTree(ent);
+        this.renderTree(ent, this._scrollMem.events && this._scrollMem.events.ts);
         break;
       }
       case 'fx-field': {
@@ -516,21 +634,24 @@ const Panel = {
           const te = Store.entity(t.value);
           fx.paramId = te && te.params[0] ? te.params[0].id : '';
           Store.save(); this.render(); MapView.render();
-        } else if (f === 'paramId') { fx.paramId = t.value; Store.save(); MapView.render(); }
+        } else if (f === 'paramId') {
+          fx.paramId = t.value; Store.save();
+          this.renderInspector(ent); MapView.render();
+        }
         else if (f === 'op') { fx.op = t.value; Store.save(); MapView.render(); }
         else if (f === 'value') { fx.value = t.value; Store.save(); this._validateInspector(ent, found.node); }
         else if (f === 'condition') { fx.condition = t.value; Store.save(); this._validateInspector(ent, found.node); }
-        else if (f === 'chance') { fx.chance = U.clamp(U.num(t.value, 100) / 100, 0, 1); Store.save(); }
+        else if (f === 'chance') { fx.chance = t.value; Store.save(); this._validateInspector(ent, found.node); }
         else if (f === 'priority') { fx.priority = U.num(t.value, 0); Store.save(); }
         break;
       }
       case 'edge-field': {
         const ed = ent.events.edges.find(x => x.id === id);
         if (!ed) break;
-        if (f === 'to') { ed.to = t.value; Store.save(); this.renderTree(ent); }
-        else if (f === 'condition') { ed.condition = t.value; Store.save(); this.renderTree(ent); }
-        else if (f === 'chance') { ed.chance = U.clamp(U.num(t.value, 100) / 100, 0, 1); Store.save(); this.renderTree(ent); }
-        else if (f === 'priority') { ed.priority = U.num(t.value, 0); Store.save(); this.renderTree(ent); }
+        if (f === 'to') { ed.to = t.value; Store.save(); this.renderTree(ent, this._scrollMem.events && this._scrollMem.events.ts); }
+        else if (f === 'condition') { ed.condition = t.value; Store.save(); this.renderTree(ent, this._scrollMem.events && this._scrollMem.events.ts); }
+        else if (f === 'chance') { ed.chance = t.value; Store.save(); this.renderTree(ent, this._scrollMem.events && this._scrollMem.events.ts); }
+        else if (f === 'priority') { ed.priority = U.num(t.value, 0); Store.save(); this.renderTree(ent, this._scrollMem.events && this._scrollMem.events.ts); }
         break;
       }
       case 'impact-prio': {
@@ -569,7 +690,7 @@ const Panel = {
       }
       case 'add-param': {
         if (!ent) break;
-        ent.params.push(normParam({ id: U.uid(), name: 'параметр ' + (ent.params.length + 1), value: 0 }));
+        ent.params.push(normParam({ id: U.uid(), name: 'параметр ' + (ent.params.length + 1), type: 'num', value: 0 }));
         Store.save(); this.render(); MapView.render();
         break;
       }
@@ -607,10 +728,13 @@ const Panel = {
       }
       case 'add-node': {
         if (!ent) break;
+        const ts = this.el.querySelector('.tree-scroll');
+        const wx = ts ? ts.scrollLeft + ts.clientWidth / 2 - TREE_OFF - this.NW / 2 : 40;
+        const wy = ts ? ts.scrollTop + ts.clientHeight / 2 - TREE_OFF - this.NH / 2 : 40;
         const idx = ent.events.nodes.length;
         const node = normNode({
           id: U.uid(), name: 'Событие ' + (idx + 1),
-          x: 40 + (idx % 3) * 210, y: 40 + Math.floor(idx / 3) * 120,
+          x: Math.round(wx), y: Math.round(wy),
           color: U.PALETTE_NODE[idx % U.PALETTE_NODE.length],
           duration: 1, effects: [],
         }, idx);
@@ -618,12 +742,6 @@ const Panel = {
         if (!ent.events.entryId) ent.events.entryId = node.id;
         sel.nodeId = node.id;
         Store.save(); this.render(); MapView.render();
-        break;
-      }
-      case 'tnode-select': {
-        sel.nodeId = id;
-        this.renderTree(ent);
-        this.renderInspector(ent);
         break;
       }
       case 'del-node': {
@@ -648,11 +766,10 @@ const Panel = {
         if (!ent || !sel.nodeId) break;
         const n = ent.events.nodes.find(x => x.id === sel.nodeId);
         if (!n) break;
-        const te = Store.entity(ent.id);
         n.effects.push(normEffect({
-          id: U.uid(), targetEntityId: te.id,
-          paramId: te.params[0] ? te.params[0].id : '',
-          op: 'add', value: '1', condition: '', chance: 1, priority: 0,
+          id: U.uid(), targetEntityId: ent.id,
+          paramId: ent.params[0] ? ent.params[0].id : '',
+          op: 'add', value: '1', condition: '', chance: '100', priority: 0,
         }));
         Store.save(); this.render(); MapView.render();
         break;
@@ -669,7 +786,7 @@ const Panel = {
         if (!ent || !sel.nodeId) break;
         const others = ent.events.nodes.filter(n => n.id !== sel.nodeId);
         if (!others.length) { alert('Нужна хотя бы ещё одна нода-цель. Создайте второе событие.'); return; }
-        ent.events.edges.push(normEdge({ id: U.uid(), from: sel.nodeId, to: others[0].id, condition: '', chance: 1, priority: 0 }));
+        ent.events.edges.push(normEdge({ id: U.uid(), from: sel.nodeId, to: others[0].id, condition: '', chance: '100', priority: 0 }));
         Store.save(); this.render();
         break;
       }
@@ -677,7 +794,7 @@ const Panel = {
         if (!ent) break;
         ent.events.edges = ent.events.edges.filter(x => x.id !== id);
         Store.save();
-        this.renderTree(ent);
+        this.renderTree(ent, this._scrollMem.events && this._scrollMem.events.ts);
         this.renderInspector(ent);
         break;
       }

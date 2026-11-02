@@ -1,10 +1,12 @@
 'use strict';
 /* ============================================================
    MapView — карта сущностей: точки-сущности и стрелки воздействий.
-   Цвет стрелки = цвет события-источника. Поддержка pan/zoom,
-   перетаскивания сущностей, подсветки активного события во время
-   симуляции, «всплывающих» изменений параметров и режима
-   затемнения для панели воздействий.
+   Одна стрелка на пару (событие → целевая сущность): толщина
+   растёт с числом меняемых параметров, рядом подпись (параметры
+   с операциями и длительность события), в тултипе — столбик
+   изменений. Цвет стрелки = цвет события. Стрелки активного
+   события подсвечиваются анимацией. Pan/zoom, затемнение для
+   панели воздействий, «всплывающие» изменения параметров.
    ============================================================ */
 
 const MapView = {
@@ -14,12 +16,12 @@ const MapView = {
   _drag: null,
   _active: {},   // entityId -> nodeId
   _hl: null,     // {entityIds:Set, nodeIds:Set}
+  _userView: false,
 
   R: 26,
 
   init() {
     this.svg = document.getElementById('mapSvg');
-    this._userView = false;
     this.svg.innerHTML =
       '<defs id="mapDefs">' +
         '<pattern id="mapGrid" width="40" height="40" patternUnits="userSpaceOnUse">' +
@@ -66,15 +68,13 @@ const MapView = {
       minX = Math.min(minX, e.x); maxX = Math.max(maxX, e.x);
       minY = Math.min(minY, e.y); maxY = Math.max(maxY, e.y);
     }
-    const pad = 140;
+    const pad = 150;
     const w = Math.max(400, maxX - minX + pad * 2);
     const h = Math.max(300, maxY - minY + pad * 2);
-    // сохраняем пропорцию области
     const rect = this.svg.getBoundingClientRect();
     const aspect = rect.width / Math.max(1, rect.height);
     let vw = w, vh = h;
     if (vw / vh < aspect) vw = vh * aspect; else vh = vw / aspect;
-    // не отдаляем сильнее минимального масштаба (иначе точки нечитаемы на узких экранах)
     const MIN_SCALE = 0.5;
     if (rect.width / vw < MIN_SCALE) {
       vw = rect.width / MIN_SCALE;
@@ -187,6 +187,9 @@ const MapView = {
     }
   },
 
+  opSym(op) { return op === 'set' ? '=' : op === 'mul' ? '×=' : op === 'toggle' ? 'inv' : '+='; },
+
+  /* Группировка: одна стрелка на (событие → целевая сущность) */
   renderEdges() {
     const page = Store.page();
     const g = document.getElementById('mapEdges');
@@ -194,47 +197,64 @@ const MapView = {
     g.innerHTML = '';
     if (!page) return;
 
-    const arrows = [];
+    const groups = new Map();
     for (const e of page.entities) {
       for (const n of e.events.nodes) {
         for (const fx of n.effects) {
           const te = fx.targetEntityId === e.id ? e : Store.entity(fx.targetEntityId);
           if (!te) continue;
           const tp = te.params.find(p => p.id === fx.paramId);
-          arrows.push({ src: e, dst: te, node: n, fx, paramName: tp ? tp.name : '?' });
+          const key = e.id + '|' + n.id + '|' + te.id;
+          if (!groups.has(key)) groups.set(key, { src: e, dst: te, node: n, fxs: [] });
+          groups.get(key).fxs.push({ fx, paramName: tp ? tp.name : '?' });
         }
       }
     }
 
-    const colors = new Set(arrows.map(a => a.node.color || '#8b98ad'));
+    const colors = new Set();
+    for (const gr of groups.values()) colors.add(gr.node.color || '#8b98ad');
     this._ensureMarkers(colors);
 
-    const pairIdx = {};
-    for (const a of arrows) {
-      const color = a.node.color || '#8b98ad';
-      const opTxt = a.fx.op === 'set' ? '= ' : a.fx.op === 'mul' ? '× ' : '';
-      const tip = a.src.name + ' ▸ ' + a.node.name + ' → ' + a.dst.name + '.' + a.paramName + ': ' + opTxt + a.fx.value +
-        (a.fx.condition ? '  [если ' + a.fx.condition + ']' : '') +
-        (a.fx.chance < 1 ? '  [шанс ' + Math.round(a.fx.chance * 100) + '%]' : '');
+    // индексы для разведения параллельных стрелок между парами сущностей
+    const pairCount = {};
+    for (const gr of groups.values()) {
+      if (gr.src.id === gr.dst.id) continue;
+      const key = [gr.src.id, gr.dst.id].sort().join('|');
+      pairCount[key] = (pairCount[key] || 0) + 1;
+      gr._pair = key; gr._idx = pairCount[key] - 1;
+    }
 
-      if (a.src.id === a.dst.id) {
-        // петля на себе
-        const x = a.src.x, y = a.src.y;
-        const d = 'M' + (x - 14) + ',' + (y - 20) + ' C' + (x - 44) + ',' + (y - 62) + ' ' + (x + 44) + ',' + (y - 62) + ' ' + (x + 14) + ',' + (y - 22);
+    for (const gr of groups.values()) {
+      const color = gr.node.color || '#8b98ad';
+      const n = gr.fxs.length;
+      const width = 2 + Math.min(6, (n - 1) * 1.6);
+      const act = this._active[gr.src.id] === gr.node.id ? ' act' : '';
+
+      // тултип: каждое воздействие с новой строки + пустая строка между ними
+      const tipLines = [gr.src.name + ' ▸ ' + gr.node.name + ' (⏱ ' + U.fmt(gr.node.duration) + 'с) → ' + gr.dst.name];
+      for (const f of gr.fxs) {
+        tipLines.push('');
+        tipLines.push('  ' + f.paramName + ' ' + this.opSym(f.fx.op) + ' ' + f.fx.value +
+          (f.fx.condition ? '   [если ' + f.fx.condition + ']' : '') +
+          (String(f.fx.chance) !== '100' ? '   [шанс ' + f.fx.chance + '%]' : ''));
+      }
+      const tip = U.esc(tipLines.join('\n'));
+
+      if (gr.src.id === gr.dst.id) {
+        const x = gr.src.x, y = gr.src.y;
+        const d = 'M' + (x - 14) + ',' + (y - 20) + ' C' + (x - 46) + ',' + (y - 64) + ' ' + (x + 46) + ',' + (y - 64) + ' ' + (x + 14) + ',' + (y - 22);
         g.insertAdjacentHTML('beforeend',
-          '<path class="arrow" d="' + d + '" stroke="' + color + '" marker-end="url(#mk-' + color.replace('#', '') + ')" ' +
-          'data-src="' + a.src.id + '" data-dst="' + a.dst.id + '" data-node="' + a.node.id + '"><title>' + U.esc(tip) + '</title></path>');
+          '<path class="arrow' + act + '" d="' + d + '" stroke="' + color + '" style="--w:' + width + '" ' +
+          'marker-end="url(#mk-' + color.replace('#', '') + ')" ' +
+          'data-src="' + gr.src.id + '" data-dst="' + gr.dst.id + '" data-node="' + gr.node.id + '"><title>' + tip + '</title></path>');
+        this._arrowLabel(g, x, y - 74, gr, color);
         continue;
       }
 
-      const key = [a.src.id, a.dst.id].sort().join('|');
-      pairIdx[key] = pairIdx[key] || { n: 0, list: [] };
-      pairIdx[key].list.push(a);
-      const total = arrows.filter(b => [b.src.id, b.dst.id].sort().join('|') === key).length;
-      const idx = pairIdx[key].n++;
-      const curve = (idx - (total - 1) / 2) * 30 + (total === 1 ? 14 : 0);
+      const total = pairCount[gr._pair];
+      const curve = (gr._idx - (total - 1) / 2) * 34 + (total === 1 ? 16 : 0);
 
-      const s = a.src, t = a.dst;
+      const s = gr.src, t = gr.dst;
       const dx = t.x - s.x, dy = t.y - s.y;
       const len = Math.hypot(dx, dy) || 1;
       const nx = -dy / len, ny = dx / len;
@@ -247,9 +267,28 @@ const MapView = {
       const d = 'M' + sx.toFixed(1) + ',' + sy.toFixed(1) + ' Q' + mx.toFixed(1) + ',' + my.toFixed(1) + ' ' + tx.toFixed(1) + ',' + ty.toFixed(1);
 
       g.insertAdjacentHTML('beforeend',
-        '<path class="arrow" d="' + d + '" stroke="' + color + '" marker-end="url(#mk-' + color.replace('#', '') + ')" ' +
-        'data-src="' + s.id + '" data-dst="' + t.id + '" data-node="' + a.node.id + '"><title>' + U.esc(tip) + '</title></path>');
+        '<path class="arrow' + act + '" d="' + d + '" stroke="' + color + '" style="--w:' + width + '" ' +
+        'marker-end="url(#mk-' + color.replace('#', '') + ')" ' +
+        'data-src="' + s.id + '" data-dst="' + t.id + '" data-node="' + gr.node.id + '"><title>' + tip + '</title></path>');
+
+      // подпись рядом со стрелкой: параметры с операциями + длительность
+      const lx = 0.25 * sx + 0.5 * mx + 0.25 * tx + nx * (width / 2 + 11) * Math.sign(curve || 1);
+      const ly = 0.25 * sy + 0.5 * my + 0.25 * ty + ny * (width / 2 + 11) * Math.sign(curve || 1);
+      this._arrowLabel(g, lx, ly, gr, color);
     }
+  },
+
+  _arrowLabel(g, x, y, gr, color) {
+    const lines = [];
+    const show = gr.fxs.slice(0, 4);
+    for (const f of show) lines.push(U.trunc(f.paramName, 14) + ' ' + this.opSym(f.fx.op));
+    if (gr.fxs.length > 4) lines.push('+' + (gr.fxs.length - 4) + '…');
+    lines.push('⏱ ' + U.fmt(gr.node.duration) + 'с');
+    const tspans = lines.map((ln, i) =>
+      '<tspan x="' + x.toFixed(1) + '" dy="' + (i === 0 ? 0 : 10.5) + '"' +
+      (ln.startsWith('⏱') ? ' class="dur"' : '') + '>' + U.esc(ln) + '</tspan>').join('');
+    g.insertAdjacentHTML('beforeend',
+      '<text class="arrow-label" x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" text-anchor="middle">' + tspans + '</text>');
   },
 
   renderNodes() {
@@ -266,7 +305,7 @@ const MapView = {
         const p = e.params[i];
         const v = Engine.values[p.id] !== undefined ? Engine.values[p.id] : p.value;
         params += '<text class="entParam" data-pid="' + p.id + '" data-pname="' + U.esc(p.name) + '" y="' + (62 + i * 14) + '">' +
-          U.esc(U.trunc(p.name, 14)) + ': ' + U.fmt(v) + '</text>';
+          U.esc(U.trunc(p.name, 14)) + ': ' + U.fmtVal(v) + '</text>';
       }
       if (e.params.length > 3) params += '<text class="entParamMore" y="' + (62 + 3 * 14) + '">+' + (e.params.length - 3) + ' ещё</text>';
 
@@ -292,15 +331,21 @@ const MapView = {
     if (nodeId) this._active[entityId] = nodeId;
     else delete this._active[entityId];
     const g = this.svg.querySelector('.ent[data-id="' + entityId + '"]');
-    if (!g) return;
-    const ring = g.querySelector('.entRing');
+    if (g) {
+      const ring = g.querySelector('.entRing');
+      if (nodeId) {
+        const node = Store.node(entityId, nodeId);
+        g.classList.add('active');
+        if (ring && node) { ring.style.stroke = node.color; ring.classList.add('on'); }
+      } else {
+        g.classList.remove('active');
+        if (ring) ring.classList.remove('on');
+      }
+    }
+    // подсветка стрелок активного события
+    this.svg.querySelectorAll('.arrow.act[data-src="' + entityId + '"]').forEach(p => p.classList.remove('act'));
     if (nodeId) {
-      const node = Store.node(entityId, nodeId);
-      g.classList.add('active');
-      if (ring && node) { ring.style.stroke = node.color; ring.classList.add('on'); }
-    } else {
-      g.classList.remove('active');
-      if (ring) ring.classList.remove('on');
+      this.svg.querySelectorAll('.arrow[data-src="' + entityId + '"][data-node="' + nodeId + '"]').forEach(p => p.classList.add('act'));
     }
   },
 
@@ -311,6 +356,7 @@ const MapView = {
       const r = g.querySelector('.entRing');
       if (r) r.classList.remove('on');
     });
+    this.svg.querySelectorAll('.arrow.act').forEach(p => p.classList.remove('act'));
   },
 
   showFx(entityId, text, cls) {
@@ -337,14 +383,14 @@ const MapView = {
 
   updateValue(paramId, val) {
     this.svg.querySelectorAll('.entParam[data-pid="' + paramId + '"]').forEach(t => {
-      t.textContent = U.trunc(t.dataset.pname, 14) + ': ' + U.fmt(val);
+      t.textContent = U.trunc(t.dataset.pname, 14) + ': ' + U.fmtVal(val);
     });
   },
 
   refreshValues() {
     this.svg.querySelectorAll('.entParam').forEach(t => {
       const v = Engine.values[t.dataset.pid];
-      if (v !== undefined) t.textContent = U.trunc(t.dataset.pname, 14) + ': ' + U.fmt(v);
+      if (v !== undefined) t.textContent = U.trunc(t.dataset.pname, 14) + ': ' + U.fmtVal(v);
     });
   },
 

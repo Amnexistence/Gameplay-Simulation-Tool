@@ -4,36 +4,37 @@
    Каждая включённая сущность — независимый процесс, идущий по
    своему дереву событий. Процесс: входит в ноду, ждёт duration
    (с учётом скорости), применяет воздействия (по условиям и
-   шансам), выбирает следующий переход (приоритет → условие →
-   шанс), иначе автоцикл в точку входа, иначе останавливается.
-   Воздействия, завершившиеся в одном кадре, применяются в
-   порядке приоритета (больший приоритет — раньше).
+   шансам), выбирает следующий переход (повтор и переходы
+   конкурируют по ПРИОРИТЕТУ: условие → шанс), иначе автоцикл
+   в точку входа, иначе останавливается.
+   Воздействия, завершившиеся в одном тике, применяются в порядке
+   приоритета (больший — раньше).
+   Типы параметров: num (с min/max-ограничением), bool, text.
+   Шансы (воздействия, переходы, повторы) — число в % или формула
+   (результат тоже в %), вычисляемая в контексте сущности.
    ============================================================ */
 
 const Engine = {
   running: false,
   time: 0,
   speed: 1,
-  values: {},      // paramId -> текущее значение
-  procs: [],       // { entityId, nodeId, timer, repeats, state: 'enter'|'run'|'done' }
+  stopCond: '',          // формула: при истине — автостоп
+  values: {},            // paramId -> текущее значение (number|boolean|string)
+  procs: [],             // { entityId, nodeId, timer, repeats, state }
   _raf: null,
   _last: 0,
   _ready: false,
   _fxOrder: 0,
 
   hooks: {
-    onEnter: null,   // (entityId, nodeId)
-    onExit: null,    // (entityId, nodeId)
-    onApply: null,   // (info)
-    onLog: null,     // (text, cls)
-    onState: null,   // старт/пауза/сброс — для обновления кнопок
-    onTick: null,    // каждый кадр — для таймера
+    onEnter: null, onExit: null, onApply: null, onLog: null,
+    onState: null, onTick: null, onReset: null,
   },
 
   log(text, cls) { if (this.hooks.onLog) this.hooks.onLog(text, cls); },
 
-  /* Разрешение переменных формул: ['золото'] — параметр контекстной
-     сущности (или первый найденный глобально), ['Враг','армия'] — явно. */
+  /* ---------- разрешение переменных формул ---------- */
+
   makeResolver(contextEntityId) {
     const self = this;
     return function (path) {
@@ -45,13 +46,19 @@ const Engine = {
         const v = self.values[p.id];
         return v === undefined ? p.value : v;
       };
+      const toNum = (v, label) => {
+        if (typeof v === 'boolean') return v ? 1 : 0;
+        if (typeof v === 'number') return v;
+        throw new Error('Параметр «' + label + '» не является числом (тип: ' +
+          (typeof v === 'string' ? 'текст' : '?') + ')');
+      };
       if (path.length === 1) {
         const name = path[0];
         if (contextEntityId) {
           const ce = page.entities.find(e => e.id === contextEntityId);
-          if (ce) { const v = val(ce, name); if (v !== null) return v; }
+          if (ce) { const v = val(ce, name); if (v !== null) return toNum(v, name); }
         }
-        for (const e of page.entities) { const v = val(e, name); if (v !== null) return v; }
+        for (const e of page.entities) { const v = val(e, name); if (v !== null) return toNum(v, name); }
         throw new Error('Параметр «' + name + '» не найден');
       }
       const ent = page.entities.find(e => e.name === path[0]);
@@ -59,9 +66,21 @@ const Engine = {
       const pname = path.slice(1).join('.');
       const v = val(ent, pname);
       if (v === null) throw new Error('Параметр «' + pname + '» не найден у сущности «' + ent.name + '»');
-      return v;
+      return toNum(v, pname);
     };
   },
+
+  /* Шанс: строка «75» (проценты) или формула (результат в процентах) → 0..1 */
+  evalChance(src, resolver, where) {
+    const s = String(src === undefined ? '100' : src).trim();
+    if (!s) return 1;
+    if (/^-?\d+(\.\d+)?$/.test(s)) return U.clamp(parseFloat(s) / 100, 0, 1);
+    const r = Formula.eval(s, resolver);
+    if (!r.ok) { this.log('⚠ ' + where + ': ошибка формулы шанса «' + s + '»: ' + r.error, 'err'); return 0; }
+    return U.clamp(r.value / 100, 0, 1);
+  },
+
+  /* ---------- управление ---------- */
 
   reset(silent) {
     this.running = false;
@@ -122,12 +141,51 @@ const Engine = {
     Store.save();
   },
 
+  /* Пошаговый дебаг: продвинуть симуляцию ровно на sec симуляционных секунд */
+  advance(sec) {
+    if (this.running) this.pause();
+    if (!this._ready) this.reset(true);
+    let rem = Math.max(0, U.num(sec, 0));
+    let guard = 0;
+    while (rem > 1e-9 && guard++ < 4000) {
+      const chunk = Math.min(0.25, rem);
+      this.time += chunk;
+      const pending = [];
+      for (const pr of this.procs) this._step(pr, chunk, pending);
+      this._applyPending(pending);
+      rem -= chunk;
+      if (this._checkStop()) break;
+      if (this.procs.length && this.procs.every(p => p.state === 'done')) {
+        this.log('■ Все цепочки событий завершены', 'sys');
+        break;
+      }
+    }
+    if (this.hooks.onTick) this.hooks.onTick();
+    if (this.hooks.onState) this.hooks.onState();
+  },
+
   activeNode(entityId) {
     const pr = this.procs.find(p => p.entityId === entityId);
     return pr && pr.state === 'run' ? pr.nodeId : null;
   },
 
-  /* ---------- внутренний шаг ---------- */
+  /* ---------- стоп-условие ---------- */
+
+  _checkStop() {
+    const cond = (this.stopCond || '').trim();
+    if (!cond) return false;
+    const r = Formula.eval(cond, this.makeResolver(null));
+    if (!r.ok) { this.log('⚠ Ошибка условия остановки «' + cond + '»: ' + r.error, 'err'); return false; }
+    if (Formula.isTruthy(r.value)) {
+      this.log('⏹ Симуляция остановлена по условию: ' + cond, 'sys');
+      if (this.running) this.pause();
+      else if (this.hooks.onState) this.hooks.onState();
+      return true;
+    }
+    return false;
+  },
+
+  /* ---------- кадр ---------- */
 
   _frame(ts) {
     let dt = (ts - this._last) / 1000;
@@ -138,13 +196,10 @@ const Engine = {
 
     const pending = [];
     for (const pr of this.procs) this._step(pr, sdt, pending);
-
-    if (pending.length) {
-      pending.sort((a, b) => (b.priority - a.priority) || (a.order - b.order));
-      for (const fx of pending) this._apply(fx);
-    }
+    this._applyPending(pending);
 
     if (this.hooks.onTick) this.hooks.onTick();
+    if (this._checkStop()) return;
 
     if (this.procs.length && this.procs.every(p => p.state === 'done')) {
       this.running = false;
@@ -153,6 +208,12 @@ const Engine = {
       this.log('■ Все цепочки событий завершены', 'sys');
       if (this.hooks.onState) this.hooks.onState();
     }
+  },
+
+  _applyPending(pending) {
+    if (!pending.length) return;
+    pending.sort((a, b) => (b.priority - a.priority) || (a.order - b.order));
+    for (const fx of pending) this._apply(fx);
   },
 
   _step(pr, sdt, pending) {
@@ -166,7 +227,7 @@ const Engine = {
       pr.state = 'run';
       pr.timer = Math.max(0.02, node.duration);
       if (this.hooks.onEnter) this.hooks.onEnter(e.id, node.id);
-      return;
+      // не тратим тик на вход: событие сразу начинает тикать
     }
 
     pr.timer -= sdt;
@@ -187,6 +248,8 @@ const Engine = {
     }
   },
 
+  /* ---------- применения воздействий ---------- */
+
   _complete(e, node, pending) {
     const resolver = this.makeResolver(e.id);
     for (const fx of node.effects) {
@@ -194,69 +257,144 @@ const Engine = {
       if (!te) continue;
       const tp = te.params.find(p => p.id === fx.paramId);
       if (!tp) continue;
+      const where = e.name + ' ▸ ' + node.name;
 
       if (fx.condition && fx.condition.trim()) {
         const r = Formula.eval(fx.condition, resolver);
-        if (!r.ok) {
-          this.log('⚠ ' + e.name + ' ▸ ' + node.name + ': ошибка условия «' + fx.condition + '»: ' + r.error, 'err');
-          continue;
-        }
+        if (!r.ok) { this.log('⚠ ' + where + ': ошибка условия «' + fx.condition + '»: ' + r.error, 'err'); continue; }
         if (!Formula.isTruthy(r.value)) continue;
       }
 
-      const chance = typeof fx.chance === 'number' ? fx.chance : 1;
+      const chance = this.evalChance(fx.chance, resolver, where);
       if (chance < 1 && Math.random() >= chance) continue;
 
-      const vr = Formula.eval(fx.value, resolver);
-      if (!vr.ok) {
-        this.log('⚠ ' + e.name + ' ▸ ' + node.name + ': ошибка значения «' + fx.value + '»: ' + vr.error, 'err');
+      // проверка совместимости операции и типа параметра
+      if (tp.type === 'text') {
+        if (fx.op !== 'set') { this.log('⚠ ' + where + ': к текстовому параметру «' + tp.name + '» применима только операция «=»', 'err'); continue; }
+        pending.push({
+          order: this._fxOrder++, priority: fx.priority || 0,
+          paramId: tp.id, param: tp, target: te, op: fx.op,
+          mode: 'text', raw: String(fx.value),
+          srcEntity: e, srcNode: node, srcFx: fx,
+        });
         continue;
       }
 
+      const vr = Formula.eval(fx.value, resolver);
+      if (!vr.ok) { this.log('⚠ ' + where + ': ошибка значения «' + fx.value + '»: ' + vr.error, 'err'); continue; }
+
+      if (tp.type === 'bool') {
+        if (fx.op !== 'set' && fx.op !== 'toggle') { this.log('⚠ ' + where + ': булев параметр «' + tp.name + '» поддерживает только «=» и инверсию', 'err'); continue; }
+        pending.push({
+          order: this._fxOrder++, priority: fx.priority || 0,
+          paramId: tp.id, param: tp, target: te, op: fx.op,
+          mode: 'bool', amount: vr.value,
+          srcEntity: e, srcNode: node, srcFx: fx,
+        });
+        continue;
+      }
+
+      // num
       pending.push({
-        order: this._fxOrder++,
-        priority: fx.priority || 0,
-        paramId: tp.id, param: tp, target: te,
-        op: fx.op, amount: vr.value,
+        order: this._fxOrder++, priority: fx.priority || 0,
+        paramId: tp.id, param: tp, target: te, op: fx.op,
+        mode: 'num', amount: vr.value,
         srcEntity: e, srcNode: node, srcFx: fx,
       });
     }
   },
 
+  _apply(fx) {
+    const cur = this.values[fx.paramId];
+    const old = cur === undefined ? fx.param.value : cur;
+    let nv, display, cls;
+
+    if (fx.mode === 'text') {
+      nv = fx.raw;
+      display = '= ' + U.trunc(nv, 10);
+      cls = 'fx-set';
+    } else if (fx.mode === 'bool') {
+      if (fx.op === 'toggle') nv = !old;
+      else nv = Formula.isTruthy(fx.amount);
+      display = (fx.op === 'toggle' ? '→ ' : '= ') + (nv ? 'да' : 'нет');
+      cls = 'fx-set';
+    } else {
+      let n;
+      if (fx.op === 'set') n = fx.amount;
+      else if (fx.op === 'mul') n = old * fx.amount;
+      else n = old + fx.amount;
+      if (typeof n !== 'number' || isNaN(n)) {
+        this.log('⚠ Результат не число: ' + fx.target.name + '.' + fx.param.name, 'err');
+        return;
+      }
+      // ограничение min/max: воздействие не блокируется, значение зажимается
+      if (fx.param.min !== null && fx.param.min !== undefined) n = Math.max(fx.param.min, n);
+      if (fx.param.max !== null && fx.param.max !== undefined) n = Math.min(fx.param.max, n);
+      nv = n;
+      display = (fx.op === 'set' ? '= ' : fx.op === 'mul' ? '× ' : (fx.amount >= 0 ? '+' : '')) + U.fmt(fx.op === 'mul' || fx.op === 'set' ? fx.amount : fx.amount);
+      cls = fx.op === 'add' ? (fx.amount >= 0 ? 'fx-pos' : 'fx-neg') : 'fx-set';
+    }
+
+    this.values[fx.paramId] = nv;
+
+    this.log(
+      '[' + U.fmt(this.time) + 'с] ' + fx.srcEntity.name + ' ▸ ' + fx.srcNode.name + ': ' +
+      fx.target.name + '.' + fx.param.name + ' ' + display +
+      ' (' + U.fmtVal(old) + ' → ' + U.fmtVal(nv) + ')',
+      cls === 'fx-pos' ? 'pos' : cls === 'fx-neg' ? 'neg' : 'rep'
+    );
+
+    if (this.hooks.onApply) this.hooks.onApply({
+      srcEntityId: fx.srcEntity.id, srcNodeId: fx.srcNode.id,
+      targetEntityId: fx.target.id, targetName: fx.target.name,
+      paramId: fx.paramId, paramName: fx.param.name, type: fx.param.type,
+      op: fx.op, amount: fx.mode === 'num' ? fx.amount : null,
+      display, cls, old, val: nv,
+    });
+  },
+
+  /* ---------- выбор следующего узла ---------- */
+
   _nextNode(e, node, pr) {
     const en = e.events;
     const resolver = this.makeResolver(e.id);
+    const where = e.name + ' ▸ ' + node.name;
 
-    // повтор текущего события
-    const rc = node.repeatChance || 0;
-    if (rc > 0) {
-      let ok = Math.random() < rc;
-      if (ok && node.repeatCond && node.repeatCond.trim()) {
-        const r = Formula.eval(node.repeatCond, resolver);
-        if (!r.ok) { this.log('⚠ ' + e.name + ' ▸ ' + node.name + ': ошибка условия повтора: ' + r.error, 'err'); ok = false; }
-        else ok = Formula.isTruthy(r.value);
-      }
-      if (ok && (!node.repeatLimit || pr.repeats < node.repeatLimit)) {
+    // кандидаты: повтор (сам в себя) и переходы — конкурируют по приоритету
+    const cands = [];
+    if (parseFloat(String(node.repeatChance)) > 0 || !/^-?\d+(\.\d+)?$/.test(String(node.repeatChance).trim())) {
+      cands.push({ kind: 'repeat', prio: node.repeatPriority || 0 });
+    }
+    for (const ed of en.edges.filter(x => x.from === node.id)) {
+      cands.push({ kind: 'edge', ed, prio: ed.priority || 0 });
+    }
+    cands.sort((a, b) => b.prio - a.prio);
+
+    for (const c of cands) {
+      if (c.kind === 'repeat') {
+        const ch = this.evalChance(node.repeatChance, resolver, where + ' (повтор)');
+        if (!(ch > 0 && Math.random() < ch)) continue;
+        if (node.repeatCond && node.repeatCond.trim()) {
+          const r = Formula.eval(node.repeatCond, resolver);
+          if (!r.ok) { this.log('⚠ ' + where + ': ошибка условия повтора: ' + r.error, 'err'); continue; }
+          if (!Formula.isTruthy(r.value)) continue;
+        }
+        if (node.repeatLimit && pr.repeats >= node.repeatLimit) continue;
         pr.repeats++;
         this.log('⟳ ' + e.name + ': повтор события «' + node.name + '» (' + pr.repeats + (node.repeatLimit ? '/' + node.repeatLimit : '') + ')', 'rep');
         return node;
+      } else {
+        const ed = c.ed;
+        if (ed.condition && ed.condition.trim()) {
+          const r = Formula.eval(ed.condition, resolver);
+          if (!r.ok) { this.log('⚠ ' + e.name + ': ошибка условия перехода «' + ed.condition + '»: ' + r.error, 'err'); continue; }
+          if (!Formula.isTruthy(r.value)) continue;
+        }
+        const ch = this.evalChance(ed.chance, resolver, e.name + ' (переход)');
+        if (ch < 1 && Math.random() >= ch) continue;
+        const tn = en.nodes.find(n => n.id === ed.to);
+        if (tn) return tn;
       }
-    }
-    pr.repeats = 0;
-
-    // переходы: приоритет → условие → шанс
-    const outs = en.edges.filter(ed => ed.from === node.id)
-      .sort((a, b) => (b.priority || 0) - (a.priority || 0));
-    for (const ed of outs) {
-      if (ed.condition && ed.condition.trim()) {
-        const r = Formula.eval(ed.condition, resolver);
-        if (!r.ok) { this.log('⚠ ' + e.name + ': ошибка условия перехода «' + ed.condition + '»: ' + r.error, 'err'); continue; }
-        if (!Formula.isTruthy(r.value)) continue;
-      }
-      const ch = typeof ed.chance === 'number' ? ed.chance : 1;
-      if (ch < 1 && Math.random() >= ch) continue;
-      const tn = en.nodes.find(n => n.id === ed.to);
-      if (tn) return tn;
     }
 
     // автоцикл
@@ -265,34 +403,5 @@ const Engine = {
       if (entry) return entry;
     }
     return null;
-  },
-
-  _apply(fx) {
-    const cur = this.values[fx.paramId];
-    const old = cur === undefined ? fx.param.value : cur;
-    let nv;
-    if (fx.op === 'set') nv = fx.amount;
-    else if (fx.op === 'mul') nv = old * fx.amount;
-    else nv = old + fx.amount;
-    if (typeof nv !== 'number' || isNaN(nv)) {
-      this.log('⚠ Результат не число: ' + fx.target.name + '.' + fx.param.name, 'err');
-      return;
-    }
-    this.values[fx.paramId] = nv;
-
-    const sign = fx.op === 'set' ? '= ' : fx.op === 'mul' ? '× ' : (fx.amount >= 0 ? '+' : '');
-    this.log(
-      '[' + U.fmt(this.time) + 'с] ' + fx.srcEntity.name + ' ▸ ' + fx.srcNode.name + ': ' +
-      fx.target.name + '.' + fx.param.name + ' ' + sign + U.fmt(fx.amount) +
-      ' (' + U.fmt(old) + ' → ' + U.fmt(nv) + ')',
-      fx.amount >= 0 && fx.op !== 'mul' ? 'pos' : 'neg'
-    );
-
-    if (this.hooks.onApply) this.hooks.onApply({
-      srcEntityId: fx.srcEntity.id, srcNodeId: fx.srcNode.id,
-      targetEntityId: fx.target.id, targetName: fx.target.name,
-      paramId: fx.paramId, paramName: fx.param.name,
-      op: fx.op, amount: fx.amount, old, val: nv,
-    });
   },
 };
