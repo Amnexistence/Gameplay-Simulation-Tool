@@ -145,20 +145,10 @@ const Engine = {
   advance(sec) {
     if (this.running) this.pause();
     if (!this._ready) this.reset(true);
-    let rem = Math.max(0, U.num(sec, 0));
-    let guard = 0;
-    while (rem > 1e-9 && guard++ < 4000) {
-      const chunk = Math.min(0.25, rem);
-      this.time += chunk;
-      const pending = [];
-      for (const pr of this.procs) this._step(pr, chunk, pending);
-      this._applyPending(pending);
-      rem -= chunk;
-      if (this._checkStop()) break;
-      if (this.procs.length && this.procs.every(p => p.state === 'done')) {
-        this.log('■ Все цепочки событий завершены', 'sys');
-        break;
-      }
+    this._runFor(Math.max(0, U.num(sec, 0)), 200000);
+    this._checkStop();
+    if (this.procs.length && this.procs.every(p => p.state === 'done')) {
+      this.log('■ Все цепочки событий завершены', 'sys');
     }
     if (this.hooks.onTick) this.hooks.onTick();
     if (this.hooks.onState) this.hooks.onState();
@@ -191,12 +181,7 @@ const Engine = {
     let dt = (ts - this._last) / 1000;
     this._last = ts;
     if (dt > 0.25) dt = 0.25;
-    const sdt = dt * this.speed;
-    this.time += sdt;
-
-    const pending = [];
-    for (const pr of this.procs) this._step(pr, sdt, pending);
-    this._applyPending(pending);
+    this._runFor(dt * this.speed, 1024);
 
     if (this.hooks.onTick) this.hooks.onTick();
     if (this._checkStop()) return;
@@ -210,42 +195,89 @@ const Engine = {
     }
   },
 
-  _applyPending(pending) {
-    if (!pending.length) return;
-    pending.sort((a, b) => (b.priority - a.priority) || (a.order - b.order));
-    for (const fx of pending) this._apply(fx);
+  /* ---------- дискретно-событийное ядро ----------
+     Продвигает симуляцию ровно на sdt симуляционных секунд.
+     Часы переводятся к моменту ближайшего завершения события;
+     воздействия применяются СРАЗУ в этот момент, поэтому условия
+     и формулы следующих (более поздних) событий видят свежие
+     значения. Траектория не зависит от скорости симуляции и
+     частоты кадров. События, совпавшие по времени, применяются
+     пакетом в порядке приоритета. */
+  _runFor(sdt, maxEvents) {
+    let rem = Math.max(0, sdt);
+    let events = 0;
+    const cap = maxEvents || 1024;
+
+    // процессы в состоянии входа активируются в текущий момент
+    for (const pr of this.procs) if (pr.state === 'enter') this._enterProc(pr);
+
+    while (rem > 1e-9 && events < cap) {
+      let minT = Infinity;
+      for (const pr of this.procs) {
+        if (pr.state === 'run' && pr.timer < minT) minT = pr.timer;
+      }
+      if (minT === Infinity) break;              // активных процессов нет
+      if (minT > rem + 1e-9) {                   // завершений на отрезке не будет
+        for (const pr of this.procs) if (pr.state === 'run') pr.timer -= rem;
+        this.time += rem;
+        rem = 0;
+        break;
+      }
+      // переводим часы к ближайшему событию
+      for (const pr of this.procs) if (pr.state === 'run') pr.timer -= minT;
+      this.time += minT;
+      rem -= minT;
+      // все завершения в этот момент (одновременные — пакетом по приоритету)
+      const pending = [];
+      for (const pr of this.procs) {
+        if (pr.state === 'run' && pr.timer <= 1e-9) {
+          this._completeProc(pr, pending);
+          events++;
+        }
+      }
+      this._applyPending(pending);
+    }
+    if (rem > 1e-9) {
+      // исчерпан лимит событий за вызов (патологически короткие циклы):
+      // просто дочитываем оставшийся отрезок без завершений
+      for (const pr of this.procs) if (pr.state === 'run') pr.timer -= rem;
+      this.time += rem;
+    }
   },
 
-  _step(pr, sdt, pending) {
-    if (pr.state === 'done') return;
+  _enterProc(pr) {
     const e = Store.entity(pr.entityId);
     if (!e || !e.enabled) { pr.state = 'done'; return; }
     const node = e.events.nodes.find(n => n.id === pr.nodeId);
     if (!node) { pr.state = 'done'; return; }
+    pr.state = 'run';
+    pr.timer = Math.max(0.02, node.duration);
+    if (this.hooks.onEnter) this.hooks.onEnter(e.id, node.id);
+  },
 
-    if (pr.state === 'enter') {
-      pr.state = 'run';
-      pr.timer = Math.max(0.02, node.duration);
-      if (this.hooks.onEnter) this.hooks.onEnter(e.id, node.id);
-      // не тратим тик на вход: событие сразу начинает тикать
+  _completeProc(pr, pending) {
+    const e = Store.entity(pr.entityId);
+    if (!e || !e.enabled) { pr.state = 'done'; return; }
+    const node = e.events.nodes.find(n => n.id === pr.nodeId);
+    if (!node) { pr.state = 'done'; return; }
+    this._complete(e, node, pending);
+    if (this.hooks.onExit) this.hooks.onExit(e.id, node.id);
+    const next = this._nextNode(e, node, pr);
+    if (!next) {
+      pr.state = 'done';
+      this.log(e.name + ': цепочка событий завершена (нет доступных переходов)', 'sys');
+      return;
     }
+    pr.nodeId = next.id;
+    pr.state = 'run';
+    pr.timer = Math.max(0.02, next.duration);
+    if (this.hooks.onEnter) this.hooks.onEnter(e.id, next.id);
+  },
 
-    pr.timer -= sdt;
-    let guard = 0;
-    while (pr.timer <= 0 && pr.state === 'run' && guard++ < 8) {
-      this._complete(e, node, pending);
-      if (this.hooks.onExit) this.hooks.onExit(e.id, node.id);
-      const next = this._nextNode(e, node, pr);
-      if (!next) {
-        pr.state = 'done';
-        this.log(e.name + ': цепочка событий завершена (нет доступных переходов)', 'sys');
-        break;
-      }
-      pr.nodeId = next.id;
-      pr.timer += Math.max(0.02, next.duration);
-      pr.state = 'run';
-      if (this.hooks.onEnter) this.hooks.onEnter(e.id, next.id);
-    }
+  _applyPending(pending) {
+    if (!pending.length) return;
+    pending.sort((a, b) => (b.priority - a.priority) || (a.order - b.order));
+    for (const fx of pending) this._apply(fx);
   },
 
   /* ---------- применения воздействий ---------- */

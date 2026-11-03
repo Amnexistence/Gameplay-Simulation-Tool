@@ -597,7 +597,8 @@ const Panel = {
       case 'param-min': case 'param-max': {
         const p = ent.params.find(x => x.id === id);
         if (!p) break;
-        p[f === 'param-min' ? 'min' : 'max'] = t.value === '' ? null : U.num(t.value, null);
+        // важно: используем inp (data-inp), а не f (data-f) — у этих полей data-f нет
+        p[inp === 'param-min' ? 'min' : 'max'] = t.value === '' ? null : U.num(t.value, null);
         Store.save();
         break;
       }
